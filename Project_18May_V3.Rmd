@@ -1,0 +1,417 @@
+---
+title: "Project: High Dimensional Data"
+author: "Sunil Raut Kshetri, Zdenko Heyvaert, Matthias Van Limbergen, Tim Msc"
+date: "5 June 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+# An executive summary of about half a page... 
+
+## Loading in the data
+We construct the data matrix `X` and the class vector `Y`:
+```{r}
+load("X_GSE21374.rda")
+load("RejectionStatus.rda")
+
+# data matrix
+X <- t(X_GSE21374)
+rm(X_GSE21374)
+
+# class vector
+Y <- RejectionStatus$Reject_Status
+rm(RejectionStatus)
+```
+
+## Descriptives
+The classes are imbalanced, we should pay attention to this when splitting the data in training and test sets:
+```{r}
+table(Y)
+```
+The data matrix is already centered and scaled
+```{r, fig.height = 3, fig.width = 5}
+par(mfrow=c(1,2))
+boxplot(colMeans(X), main = "means")
+boxplot(apply(X,2,var), main = "variances")
+```
+
+## Research question 1:  explore whether the variability in gene expression levels is associated with rejection status
+
+We start by performing an SVD on the data matrix to see whether we are able to visualize the variability in gene expression levels in a lower dimension:
+```{r}
+X.svd <- svd(X)
+nEig <- length(X.svd$d)
+totvar <- sum(X.svd$d^2)/(nEig -1)
+```
+Now we construct the scree plot, on the right we have the same plot but zoomed in on the first 5 dimensions:
+```{r, fig.height = 3, fig.width = 8}
+cSum <- X.svd$d^2
+
+layout(matrix(c(rep(1,3),2), 1, 4, byrow = TRUE))
+barplot(cumsum(cSum/(nEig-1)/totvar), names.arg = 1:length(cSum),
+        ylab = "cumulative proportion", cex.lab = 1.5,
+        ylim = c(0,1))
+abline(h=0.8)
+
+barplot(cumsum(cSum[1:5]/(nEig-1)/totvar), names.arg = 1:5,
+        ylab = "cumulative proportion", cex.lab = 1.5)
+abline(h=0.8)
+
+rm(X.svd, cSum, nEig, totvar)
+```
+The first two PCs explain less than 25% of the variability in the gene expressions; up to 120 PCs are necessary to represent 80% of the variability. Therefore, representing the data in 2 dimensions using MDS is not an option to assess the true variability of the genes.
+
+Because we are looking for the association between gene expression variability and rejection status, we propose a supervised approach like LDA. However, because of the large amount of genes, it is computationally impossible to perform an LDA on the entire data set. Therefore, we first have to perform some kind of feature selection. We will use the theory of large scale hypothesis testing to select the features that have a signficant association with the rejection status.
+
+We start by calculating the $p$-values of all genes
+```{r}
+# the number of genes
+cols <- ncol(X)
+
+# initialize vector with p-values
+p.values <- rep(NA, cols)
+
+# calculate and store p-values of each gene
+for (i in 1:cols) {
+  test <- t.test(X[,i] ~ Y)
+  p.values[i] <- test$p.value
+}
+rm(cols, i)
+```
+
+Now we calculate the adjusted $p$-values using both the Benjamini & Hochberg and Bonferroni algorithms:
+```{r}
+p.values.bh <- p.adjust(p.values, method = "BH")
+p.values.bon <- p.adjust(p.values, method = "bonferroni")
+sum(p.values.bh < 0.05)/length(p.values) # 24%
+sum(p.values.bon < 0.05)/length(p.values) # 3%
+rm(p.values)
+```
+BH keeps 24\% of all genes as signficant (13531 features), Bonferroni only 3\% (1613 featues). Let's start off  performing LDA on the 13531 significant features according to the BH correction:
+
+```{r}
+# necessary package for lda() function
+library(MASS)
+
+# subselection of the data matrix 
+Xr <- X[, p.values.bh < 0.05]
+rm(p.values.bh)
+
+# performing LDA on the reduced data matrix
+Xr.lda <- lda(Xr, grouping = Y) # takes ~1 minute to run
+
+# matrix to transform observations to discriminant functions
+V1 <- Xr.lda$scaling
+
+# the first (and only) discriminant
+Z1 <- Xr %*% V1
+rm(V1, Xr, Xr.lda)
+
+# calculate AUC
+library(MLmetrics)
+AUC(Z1,Y) # 94.5%
+```
+Let's visualize the separation between the two classes:
+```{r, fig.height = 3, fig.width = 4}
+library(ggplot2)
+
+ggplot(data.frame(Status = factor(ifelse(Y==1,"rejected","accepted")), Z1 = Z1),
+       aes(x = Status, y = Z1)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(aes(color = Status), position = position_jitter(0.2), cex = 0.5) +
+  theme_bw()
+```
+The boxplot appears to indicate that the values of $Z_1$ are different for the rejected and the non-rejected group, though the separation is not perfect. 
+
+Now for the Bonferroni corrected $p$-values:
+```{r}
+# subselection of the data matrix 
+Xr <- X[, p.values.bon < 0.05]
+rm(p.values.bon)
+
+# performing LDA on the reduced data matrix
+Xr.lda <- lda(Xr, grouping = Y)
+
+# matrix to transform observations to discriminant functions
+V1 <- Xr.lda$scaling
+
+# the first (and only) discriminant
+Z1 <- Xr %*% V1
+rm(V1, Xr.lda)
+
+# calculate AUC
+AUC(Z1,Y) # 96.8%
+```
+
+The AUC value is higher than for the BH corrected $p$-values, even though we are considering fewer features in this case!
+```{r, fig.height = 3, fig.width = 4}
+library(ggplot2)
+
+ggplot(data.frame(Status = factor(ifelse(Y==1,"rejected","accepted")), Z1 = Z1),
+       aes(x = Status, y = Z1)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(aes(color = Status), position = position_jitter(0.2), cex = 0.5) +
+  theme_bw()
+```
+The separation looks better in this case. We can look if we can reduce the number of features even further using sparse LDA.
+```{r, fig.height = 3.5, fig.width = 5}
+library(glmnet)
+set.seed(45)
+lda_loadings <- cv.glmnet(Xr, Z1, alpha = 0.5)
+plot(lda_loadings)
+```
+Of the 1613 features found to be significant according to the Bonferroni correction, we should only keep $\approx 130$ in the model (1 SE away from minimum):
+```{r}
+sparse_lda_loadings <- as.vector(coef(lda_loadings, s = lda_loadings$lambda.1se))
+
+# without intercept
+SLDA <- Xr %*% sparse_lda_loadings[-1]
+
+# calculate AUC
+AUC(SLDA,Y) # 97.7%
+```
+The AUC value has only slightly been reduced by taking only 10% of the features. Separation looks slightly worse but not as bad as for the BH corrected $p$-values, and we only use 133 features!
+```{r, fig.height = 3, fig.width = 4}
+library(ggplot2)
+
+ggplot(data.frame(Status = factor(ifelse(Y==1,"rejected","accepted")), SLDA = SLDA),
+       aes(x = Status, y = SLDA)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(aes(color = Status), position = position_jitter(0.2), cex = 0.5) +
+  theme_bw()
+```
+In an attempt to visualize variability in the space of the remaining 133 features, we will present them in a heatmap, where a vertical bar denotes the class label of the observations.
+Hierarchial clustering is performed to see if the clusters more or less coincide with the known class labels.
+```{r}
+suppressPackageStartupMessages(library(dendextend))
+
+# get the 133 features used for the sparse LDA
+features <- coef(lda_loadings, s = lda_loadings$lambda.1se)
+features <- features@i # indices of the non-zero features
+Xrr <- Xr[, features]
+
+# constructing the dendrogram
+library(dendextend)
+d_x <- dist(Xrr) # distance matrix
+hc_x <- hclust(d_x, method = "complete") # hierarchial clustering
+dend <- as.dendrogram(hc_x)
+
+# color the branches based on the clusters:
+dend <- color_branches(dend, k = 2)
+
+library(colorspace) # get nice colors
+rejected_col <- (rainbow_hcl(2))[factor(Y)]
+
+# manually match the labels, as much as possible, to the real classification of the patients:
+labels_colors(dend) <- rainbow_hcl(2)[sort_levels_values(Y[order.dendrogram(dend)])]
+
+gplots::heatmap.2((Xrr), 
+                  main = paste("Selected", 
+                               ncol(Xrr), 
+                               "genes with significant contribution"),
+                  dendrogram = "row",
+                  Rowv = dend,
+                  trace = "none",          
+                  margins = c(2,2),      
+                  density.info = "none",
+                  RowSideColors = rejected_col,
+                  col = rev(terrain.colors(2, alpha = 0.5)), # viridis,
+                  labRow = FALSE, 
+                  labCol = FALSE,
+                  xlab = "selected genes",
+                  ylab = "observations"
+)
+```
+Each column in the heatmap corresponds to one of the 133 genes that were selected from the sparse LDA, each row is one of the 282 observed patients. For simplicity, we draw the heatmap with only two colors: green means the selected gene has an above-average expression for the given patient, white means it has a below-average expression for the given patient. Hierarchial clustering was performed on this heatmap, the resulting dendrogram as plotted at the left. We divided it up in two clusters: teal and pink, which we hope would correspond to the rejected and accepted patients, respectively. The true labels for each patient are shown in the vertical bar between the dendrogram and the heatmap, teal corresponding to the rejected patients and pink to the accepted patients.
+
+From the heatmap it is clear that these genes play a role in whether a patient will accept or reject a kidney. The combination of below-average expression for the leftmost genes and an above-average expression for the rightmost genes is the signature of rejection, while the inverse is the signature of acceptance. There are some "misclassifications", patients that fall in another cluster than we would expect, though note that most of these occur in observations where the gene expressions for both the leftmost and rightmost genes are similar. Indeed, the pink cluster could be subdivided in two subclusters, one with gene expressions that really resemble acceptance behaviour, and one with a more intermediary regime where one indeed finds patients of both rejection groups.
+
+## Q2
+
+### spliting data into a test (30%) and training (70%) dataset
+
+
+```{r}
+rm(SLDA,Xr,Xrr,Z1,d_x,dend,features,hc_x,lda_loadings,rejected_col,sparse_lda_loadings,test)
+# split data
+set.seed(123)
+pTrain <- 0.7 # 70% training
+
+# With stratifing since unbalanced data
+id.accept <- which(Y == 0)
+id.reject <- which(Y == 1)
+trainID.accept <- sample(id.accept, ceiling(pTrain*length(id.accept)))
+trainID.reject <- sample(id.reject, floor(pTrain*length(id.reject)))
+trainID <- c(trainID.accept, trainID.reject)
+
+# Training data
+trainX <- X[trainID,]
+trainY <- Y[trainID]
+
+# Test data
+testX <- X[-trainID,]
+testY <- Y[-trainID]
+
+# Summary of splited dataset
+dataset.summary <- as.matrix(rbind(table(Y),
+                                 table(trainY), table(testY)))
+rownames(dataset.summary) <- c("All", "Train 70%", "Test 30%")
+colnames(dataset.summary) <- c("Accepted", "Rejected")
+dataset.summary
+rm(dataset.summary,id.accept,id.reject,pTrain,trainID,trainID.accept,trainID.reject)
+```
+A stratified split is used to get an optimal split of the data since the dataset is unbalanced.
+
+### AUC Cost function
+
+The performance of all models will be evaluated by using the Area Under the curve cost function which works well for unbalanced data.
+```{r}
+# Cost function
+AUC <- function(observedY, predictedY){
+  AUC = auc(observedY, predictedY)
+  return(AUC)
+}
+```
+
+
+### Principal Component Regression (PCR)
+
+```{r}
+# singular value decomposition
+X.train.svd <- svd(trainX)
+U.train <- X.train.svd$u
+D.train <- diag(X.train.svd$d)
+Z.train <- U.train%*%D.train
+V.train <- X.train.svd$v
+# scree plot
+nEig <- length(X.train.svd$d)
+totvar <- sum(X.train.svd$d^2)/(nEig -1)
+cSum <- X.train.svd$d^2
+barplot(cumsum(cSum[1:120]/(nEig-1)/totvar), names.arg = 1:120,
+        ylab = "cumulative proportion", cex.lab = 1,
+        ylim = c(0,1))
+abline(h=0.8)
+rm(U.train,D.train,nEig,totvar,cSum)
+```
+It seems 80% of the total variance in the training dataset, is explained by the first 89 Principal components. So, we proceed our calculations to find out the minimum number of principal components needed for the principal component regression with a maximum number of PC's of 89.
+
+```{r, warning = FALSE}
+library(boot) # for cv.glm
+set.seed(123)
+nPC= 86
+K = 5 # 5 fold cross validation
+cv.pcr.error = rep(0,nPC) # Storing of errors
+
+# performing 5-fold CV of pcr with AUC cost function for nPC starting from 1 to 86
+for (i in 1:nPC){ 
+  data=data.frame(trainY=trainY, Z.train[,1:i])
+  cv.pcr.mod1=glm(trainY~.,data=data, family = "binomial")
+  cv.pcr.error[i]=cv.glm(data, cv.pcr.mod1, cost = AUC,K=K)$delta[1]
+}
+
+# Getting the Number of PCs at maximum AUC
+nPC_at_max_AUC_CV=c(1:nPC)[cv.pcr.error==max(cv.pcr.error)]
+max_AUC_CV = cv.pcr.error[nPC_at_max_AUC_CV]
+nPC_at_max_AUC_CV
+max_AUC_CV
+#Ploting results
+plot(cv.pcr.error, ylab = "AUC",xlab="n PCs", main = paste(K, "fold CV"))
+abline(v=nPC_at_max_AUC_CV, col = "red")
+rm(nPC,K,data,cv.pcr.mod1,cv.pcr.error,i)
+```
+A 5-fold cross validation approach of the principal component regression is used to verify the outcomes while still obtaining a low computational cost. A maximum AUC of 0.87 is obtained at 23 principal components. To see how well the obtained model works in predicting the outcomes of new patients the model is evaluated for the test dataset.
+
+```{r}
+# Test the model with the test dataset
+Z.test <- as.matrix(testX)%*%V.train
+testX <- data.frame(testX)
+AUC_CV_PCR=max_AUC_CV
+
+# select number of PCs based on AUC
+data=data.frame(Z.train[,1:nPC_at_max_AUC_CV])
+
+# best model based on AUC evaluation measure
+best_PCR_mod=glm(trainY~.,data=data,family="binomial")
+# best model based on AUC for prediction 
+datatest=data.frame(Z.test[,1:nPC_at_max_AUC_CV])
+
+# predict probabilities with response option
+predPCR_prob=predict(best_PCR_mod,newdata=datatest,type="response") 
+
+# test how good the best model is doing?
+AUC_test_PCR=AUC(testY,predPCR_prob)
+
+AUC_test_PCR
+AUC_CV_PCR
+
+#Really close 
+abs(AUC_CV_PCR-AUC_test_PCR)
+rm(Z.test,Z.train,best_PCR_mod,nPC_at_max_AUC_CV,predPCR_prob)
+```
+When predicting the outcomes of the testset an AUC of 0.65 is obtained. Due to this large difference in AUC for the test- (0.65) and trainset (0.87) and the very low value for the testset, it can be concluded that the obtained PCR model does not work well for predicting the outcomes of new observations. 
+
+
+## Ridge regression
+
+Besides the principal component regression; ridge- and lasso regression are also performed to obtain an optimal prediction model.
+```{r}
+#Ridge regression
+library(glmnet)
+set.seed(123)
+
+K = 5 # 5-fold CV
+ridge_mod=cv.glmnet(x = trainX, y = trainY,family="binomial",type.measure="auc",nfolds=K,alpha=0)
+plot(ridge_mod)
+
+#best gamma
+bestgamma.min=ridge_mod$lambda.min
+AUC_CV_ridge=max(ridge_mod$cvm)
+
+#we choose gamma min 
+predridge_prob=predict(ridge_mod,newx=as.matrix(testX),s=bestgamma.min,type="response")
+
+#how good are we doing on the testset?
+AUC_test_ridge=auc(testY,predridge_prob[,1])
+AUC_test_ridge
+AUC_CV_ridge
+rm(bestgamma.min,predridge_prob,ridge_mod,K)
+```
+The ridge regression model has a maximum AUC of 0.86 for the training dataset with a gamma-value of 17.22. When predicting the outcomes for the testset an AUC of 0.70 is obtained. Even though the obtained value is slightly higher than the PCR value it is still not optimal. 
+
+## Lasso regression
+```{r}
+#Lasso regression
+set.seed(123)
+K = 5 # 5-fold CV
+lasso_mod = cv.glmnet(x = trainX, y = trainY,family="binomial",type.measure="auc",nfolds=K,alpha=1)
+plot(lasso_mod)
+
+#best lambdas 
+bestlambda.min=lasso_mod$lambda.min
+AUC_CV_lasso=max(lasso_mod$cvm)
+
+#we choose gamma min 
+predlasso_prob=predict(lasso_mod,newx=as.matrix(testX),s=bestlambda.min,type="response")
+
+#how good are we doing on the testset? 
+AUC_test_lasso=auc(testY,predlasso_prob[,1])
+AUC_test_lasso
+AUC_CV_lasso
+rm(lasso_mod,K,bestlambda.min,predlasso_prob)
+```
+The ridge regression has a maximum AUC of 0.8779 for a lambda-value of 0.176 for the training dataset. When testing the model for predictions of the testset an AUC of 0.75 is obtained.
+
+```{r}
+#summarizing results
+table <- matrix(c(AUC_CV_PCR,AUC_CV_ridge,AUC_CV_lasso,AUC_test_PCR,AUC_test_ridge,AUC_test_lasso),
+                nrow=3,ncol=2,
+                dimnames= list(Regression = c("PCR","Ridge","Lasso"), AUC = c("Train","Test")))
+table
+rm(table)
+
+```
+It is clear that although all 3 models seem to work equally fine for the training dataset; the Lasso model is much better for predicting the rejection status of new patients. On top of this the Lasso model is also the least computational intensive since a lot of variables will be set to 0 which reduces the amount of computation drastically.
+Even though the Lasso model seems to be the best out of the three for predictions; it is still not optimal since the difference between Training and Test set is pretty high which could be a consequence of the unbalanced data. 
+
